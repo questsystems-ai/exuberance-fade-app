@@ -1,0 +1,36 @@
+{
+  "runs": [
+    {
+      "label": "20250917_224314Z_both_smoke_alpaca",
+      "dir": "reports\\20250917_224314Z_both_smoke_alpaca",
+      "metrics": {
+        "n_trades": 523,
+        "total_pnl": -266.1385179977276,
+        "hit_rate": 0.8279158699808795,
+        "avg_win": 1.2571598209176915,
+        "avg_loss": -9.005430227278756,
+        "win_loss_ratio": 0.1396001955697321,
+        "final_equity": 99733.86148200228,
+        "sharpe": -4.031296598599949,
+        "max_dd": -0.0032268773906047876
+      }
+    },
+    {
+      "label": "20250917_224407Z_both_smoke_polygon",
+      "dir": "reports\\20250917_224407Z_both_smoke_polygon",
+      "metrics": {
+        "n_trades": 523,
+        "total_pnl": -266.13797315655586,
+        "hit_rate": 0.8279158699808795,
+        "avg_win": 1.257161080757567,
+        "avg_loss": -9.005430234717583,
+        "win_loss_ratio": 0.1396003353522168,
+        "final_equity": 99733.86202684345,
+        "sharpe": -4.031289601167101,
+        "max_dd": -0.00322687194149196
+      }
+    }
+  ],
+  "best_total_pnl": "20250917_224407Z_both_smoke_polygon",
+  "best_sharpe": "20250917_224407Z_both_smoke_polygon"
+}

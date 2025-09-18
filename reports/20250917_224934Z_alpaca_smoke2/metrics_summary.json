@@ -1,0 +1,19 @@
+{
+  "run_id": "20250917_224934Z_alpaca_smoke2",
+  "source": "alpaca",
+  "symbols": [
+    "AAPL",
+    "MSFT"
+  ],
+  "start": "2025-07-01",
+  "end": "2025-08-31",
+  "initial_equity": 100000.0,
+  "metrics": {
+    "n_trades": 96.0,
+    "total_pnl": 72.5828372314729,
+    "hit_rate": 0.90625,
+    "avg_win": 0.9194624335536041,
+    "avg_loss": -0.8233771652989621,
+    "win_loss_ratio": 1.116696542367378
+  }
+}

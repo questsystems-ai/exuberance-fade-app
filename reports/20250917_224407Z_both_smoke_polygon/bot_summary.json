@@ -1,0 +1,19 @@
+{
+  "run_id": "20250917_224407Z_both_smoke_polygon",
+  "symbols": [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMD",
+    "TSLA"
+  ],
+  "source": null,
+  "start": "2025-06-01",
+  "end": "2025-08-31",
+  "n_trades": 523,
+  "total_pnl": -266.138,
+  "hit_rate": 0.827916,
+  "avg_win": 1.2572,
+  "avg_loss": -9.0054,
+  "win_loss_ratio": 0.1396
+}

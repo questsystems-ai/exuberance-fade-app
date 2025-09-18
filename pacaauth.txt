@@ -1,0 +1,5 @@
+65a4a439-6ff1-42dc-8603-a72c4018ffee
+endpoint: https://paper-api.alpaca.markets/v2
+key: PKZ34BJQ1DGFE9JM5NPV
+secret key: x1BWPJ1yTddpoOVZrLJESvNmnfuvRO4kvqnHTDYG
+polygon API: jT5zs9Lg8zeqP1qUlohAydN8xiLujKZn

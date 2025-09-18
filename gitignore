@@ -1,0 +1,51 @@
+# ---- Python / build ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+dist/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+
+# ---- Jupyter / notebooks ----
+.ipynb_checkpoints/
+
+# ---- Editors / OS ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- Local data & outputs (keep code repo clean) ----
+data/minute_bars/
+reports/
+charts/
+logs/
+**/*.parquet
+**/*.feather
+**/*.arrow
+**/*.csv
+alerts.log
+
+# Allow seed benchmark CSVs if you add any:
+!data/benchmarks/
+!data/benchmarks/*.csv
+
+# ---- Secrets ----
+.env
+.env.*
+*.key
+*.pem
+
+# ---- Local overrides ----
+config_local.py

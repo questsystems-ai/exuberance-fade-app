@@ -1,0 +1,22 @@
+{
+  "run_id": "20250917_224314Z_both_smoke_alpaca",
+  "source": null,
+  "symbols": [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMD",
+    "TSLA"
+  ],
+  "start": "2025-06-01",
+  "end": "2025-08-31",
+  "initial_equity": 100000.0,
+  "metrics": {
+    "n_trades": 523.0,
+    "total_pnl": -266.1385179977276,
+    "hit_rate": 0.8279158699808795,
+    "avg_win": 1.2571598209176915,
+    "avg_loss": -9.005430227278756,
+    "win_loss_ratio": 0.1396001955697321
+  }
+}
