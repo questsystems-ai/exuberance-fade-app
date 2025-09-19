@@ -1,0 +1,126 @@
+{
+  "runs": [
+    {
+      "label": "local",
+      "dir": "reports/20250918_223455Z_local_wf_2m1m_top12_s8_s0",
+      "metrics": {
+        "n_trades": 1097,
+        "total_pnl": 94.37059655868532,
+        "hit_rate": 0.8495897903372835,
+        "avg_win": 1.5317317056179784,
+        "avg_loss": -8.080020321680427,
+        "win_loss_ratio": 0.18957027886526645,
+        "final_equity": 100094.37059655869,
+        "sharpe": 0.892252901969602,
+        "max_dd": -0.003338727188641144
+      }
+    },
+    {
+      "label": "local",
+      "dir": "reports/20250918_223458Z_local_wf_2m1m_top12_s8_s1",
+      "metrics": {
+        "n_trades": 1097,
+        "total_pnl": 94.37059655868532,
+        "hit_rate": 0.8495897903372835,
+        "avg_win": 1.5317317056179784,
+        "avg_loss": -8.080020321680427,
+        "win_loss_ratio": 0.18957027886526645,
+        "final_equity": 100094.37059655869,
+        "sharpe": 0.892252901969602,
+        "max_dd": -0.003338727188641144
+      }
+    },
+    {
+      "label": "local",
+      "dir": "reports/20250918_223501Z_local_wf_2m1m_top12_s8_s2",
+      "metrics": {
+        "n_trades": 1097,
+        "total_pnl": 94.37059655868532,
+        "hit_rate": 0.8495897903372835,
+        "avg_win": 1.5317317056179784,
+        "avg_loss": -8.080020321680427,
+        "win_loss_ratio": 0.18957027886526645,
+        "final_equity": 100094.37059655869,
+        "sharpe": 0.892252901969602,
+        "max_dd": -0.003338727188641144
+      }
+    },
+    {
+      "label": "local",
+      "dir": "reports/20250918_223504Z_local_wf_2m1m_top12_s8_s3",
+      "metrics": {
+        "n_trades": 1097,
+        "total_pnl": 94.37059655868532,
+        "hit_rate": 0.8495897903372835,
+        "avg_win": 1.5317317056179784,
+        "avg_loss": -8.080020321680427,
+        "win_loss_ratio": 0.18957027886526645,
+        "final_equity": 100094.37059655869,
+        "sharpe": 0.892252901969602,
+        "max_dd": -0.003338727188641144
+      }
+    },
+    {
+      "label": "local",
+      "dir": "reports/20250918_223507Z_local_wf_2m1m_top12_s8_s4",
+      "metrics": {
+        "n_trades": 1097,
+        "total_pnl": 94.37059655868532,
+        "hit_rate": 0.8495897903372835,
+        "avg_win": 1.5317317056179784,
+        "avg_loss": -8.080020321680427,
+        "win_loss_ratio": 0.18957027886526645,
+        "final_equity": 100094.37059655869,
+        "sharpe": 0.892252901969602,
+        "max_dd": -0.003338727188641144
+      }
+    },
+    {
+      "label": "local",
+      "dir": "reports/20250918_223510Z_local_wf_2m1m_top12_s8_s5",
+      "metrics": {
+        "n_trades": 1097,
+        "total_pnl": 94.37059655868532,
+        "hit_rate": 0.8495897903372835,
+        "avg_win": 1.5317317056179784,
+        "avg_loss": -8.080020321680427,
+        "win_loss_ratio": 0.18957027886526645,
+        "final_equity": 100094.37059655869,
+        "sharpe": 0.892252901969602,
+        "max_dd": -0.003338727188641144
+      }
+    },
+    {
+      "label": "local",
+      "dir": "reports/20250918_223513Z_local_wf_2m1m_top12_s8_s6",
+      "metrics": {
+        "n_trades": 1097,
+        "total_pnl": 94.37059655868532,
+        "hit_rate": 0.8495897903372835,
+        "avg_win": 1.5317317056179784,
+        "avg_loss": -8.080020321680427,
+        "win_loss_ratio": 0.18957027886526645,
+        "final_equity": 100094.37059655869,
+        "sharpe": 0.892252901969602,
+        "max_dd": -0.003338727188641144
+      }
+    },
+    {
+      "label": "local",
+      "dir": "reports/20250918_223516Z_local_wf_2m1m_top12_s8_s7",
+      "metrics": {
+        "n_trades": 1097,
+        "total_pnl": 94.37059655868532,
+        "hit_rate": 0.8495897903372835,
+        "avg_win": 1.5317317056179784,
+        "avg_loss": -8.080020321680427,
+        "win_loss_ratio": 0.18957027886526645,
+        "final_equity": 100094.37059655869,
+        "sharpe": 0.892252901969602,
+        "max_dd": -0.003338727188641144
+      }
+    }
+  ],
+  "best_total_pnl": "local",
+  "best_sharpe": "local"
+}

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.nbi
+*.nbc
+
+# local data cache
+data/minute_bars/
+data/**/*.parquet
+
+# log/noise
+*.log
+jupyter.log

@@ -1,0 +1,26 @@
+{
+  "run_id": "20250918_223455Z_local_wf_2m1m_top12_s8_s0",
+  "symbols": [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMD",
+    "TSLA",
+    "META",
+    "GOOG",
+    "AMZN",
+    "NFLX",
+    "AVGO",
+    "INTC",
+    "MU"
+  ],
+  "source": "local",
+  "start": "2025-06-01",
+  "end": "2025-08-31",
+  "n_trades": 1097,
+  "total_pnl": 94.3706,
+  "hit_rate": 0.84959,
+  "avg_win": 1.5317,
+  "avg_loss": -8.08,
+  "win_loss_ratio": 0.1896
+}
