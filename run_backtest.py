@@ -6,6 +6,16 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 import pytz
+# --- guard: avoid NameError if any accidental top-level uses of `args` exist ---
+try:
+    args  # noqa: F821
+except NameError:
+    class _DummyArgs: pass
+    args = _DummyArgs()
+    args.rth_only = False
+    args.symbols = None
+# ------------------------------------------------------------------------------
+
 
 import numpy as np
 import pandas as pd
@@ -104,6 +114,48 @@ def _estimate_runtime_seconds(dfs: dict[str, pd.DataFrame], base: Params, units:
     return sec_per_row * total_rows * max(1, units)
 
 
+def symbols_for_shard(all_symbols, shard_index, shard_count):
+    """
+    Accepts symbols as:
+      - single string: "AAPL MSFT,NVDA"
+      - list/tuple: ["AAPL","MSFT",...]
+      - list with one big string: ["AAPL MSFT NVDA"]
+    Returns the deterministic slice for this shard.
+    """
+    def _norm(sym_in):
+        # string -> list (supports commas or whitespace)
+        if isinstance(sym_in, str):
+            s = sym_in.strip()
+            return [t.strip() for t in (s.split(',') if ',' in s else s.split()) if t.strip()]
+        # single-element list containing a string with spaces/commas
+        if isinstance(sym_in, (list, tuple)) and len(sym_in) == 1 and isinstance(sym_in[0], str):
+            s = sym_in[0].strip()
+            return [t.strip() for t in (s.split(',') if ',' in s else s.split()) if t.strip()]
+        # general list/tuple
+        if isinstance(sym_in, (list, tuple)):
+            return list(sym_in)
+        # fallback best-effort
+        try:
+            return list(sym_in)
+        except Exception:
+            return [str(sym_in)]
+
+    all_list = _norm(all_symbols)
+    if shard_count <= 1:
+        out = all_list
+    else:
+        out = [s for idx, s in enumerate(all_list) if idx % shard_count == shard_index]
+    # Print once per process for visibility
+    global _printed_shard_syms
+    try:
+        _printed_shard_syms
+    except NameError:
+        print(f"[shard {shard_index}/{shard_count}] symbols: {out}")
+        _printed_shard_syms = True
+
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description="Exuberance Fade Backtester (Polygon/Alpaca)")
     ap.add_argument("--symbols", nargs="*", default=DEFAULT_SYMBOLS)
@@ -147,11 +199,43 @@ def main():
 
     # 1) Load & prepare data
     dfs = {}
-    for sym in tqdm(args.symbols, desc="Loading & preparing"):
+    for sym in tqdm(symbols_for_shard(args.symbols, args.shard_index, args.shard_count), desc="Loading & preparing"):
         if args.demo:
             df = generate_synthetic_minutes(sym, args.start, args.end)
         else:
             df = _load_symbol_data(sym, args.start, args.end, args.source, args.rth_only, alp_guard, pol_guard, alert)
+
+            # Recompute RTH in ET; fallback to no-RTH if empty
+# disabled top-level: if args.rth_only:
+    import pandas as _pd
+    # --- resolve timestamp column robustly ---
+    _tscol = None
+    for _cand in ['ts','timestamp','time','datetime','date','t','bar_time']:
+        if _cand in df.columns:
+            _tscol = _cand; break
+    if _tscol is None:
+        # any datetime-typed column?
+        for _c in df.columns:
+            try:
+                if _pd.api.types.is_datetime64_any_dtype(df[_c]):
+                    _tscol = _c; break
+            except Exception:
+                pass
+    if _tscol is None and str(df.index.dtype).startswith('datetime64'):
+        df = df.reset_index().rename(columns={'index':'ts'})
+        _tscol = 'ts'
+    if _tscol is None:
+        raise SystemExit(f"No timestamp column for {sym}; columns={list(df.columns)[:12]}")
+    # --- ensure UTC tz-aware, then convert to ET ---
+    df[_tscol] = _pd.to_datetime(df[_tscol], utc=True, errors='coerce')
+    _et = df[_tscol].dt.tz_convert('America/New_York')
+    _mins = _et.dt.hour*60 + _et.dt.minute
+    _is_weekday = _et.dt.dayofweek < 5
+    _rth = _is_weekday & (_mins >= 570) & (_mins <= 960)  # 09:30–16:00 ET
+    df = df.loc[_rth].copy()
+    if df.empty:
+        print(f"[WARN] {sym}: empty after RTH; retrying without RTH")
+        df = _load_symbol_data(sym, args.start, args.end, args.source, False, alp_guard, pol_guard, alert)
 
         if args.write_cache and (not args.demo) and args.source in ("alpaca","polygon"):
             os.makedirs(os.path.join(DATA_DIR, sym), exist_ok=True)
@@ -223,7 +307,7 @@ def main():
         "time_local_Pacific": now_utc.astimezone(pytz.timezone("America/Los_Angeles")).isoformat(),
         "args": vars(args),
         "params": asdict(base),
-        "symbols": args.symbols,
+        "symbols": symbols_for_shard(args.symbols, args.shard_index, args.shard_count),
         "start": args.start,
         "end": args.end,
         "source": args.source,
