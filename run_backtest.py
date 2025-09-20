@@ -273,7 +273,7 @@ def main():
     ap.add_argument("--fast", action="store_true")
     ap.add_argument("--max-combos", type=int, default=None)
     ap.add_argument("--train-months", type=int, default=None)
-    ap.add_argument("--test-months",  type:int, default=None)  # type: ignore[assignment]
+    ap.add_argument("--test-months",  type=int, default=None)  # type: ignore[assignment]
 
     ap.add_argument("--write-cache", action="store_true")
     ap.add_argument("--run-tag", type=str, default=None)
