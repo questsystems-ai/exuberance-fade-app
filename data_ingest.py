@@ -7,8 +7,21 @@ from __future__ import annotations
 
 import os
 import glob
+import math
+import time
+import random
+import asyncio
+import logging
+from collections import deque
 from dataclasses import asdict
 from typing import Iterable, List, Optional, Dict, Any, Tuple
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import httpx as _httpx
+    HTTPXAsyncClient = _httpx.AsyncClient
+else:
+    from typing import Any as HTTPXAsyncClient
 
 import numpy as np
 import pandas as pd
@@ -18,7 +31,8 @@ from utils import ensure_dt
 # --- Config keys ---
 from config import (
     DATA_DIR,
-    POLYGON_API_KEY,
+    # We intentionally DO NOT use POLYGON_API_KEY at import time; see loader: getenv at call
+    POLYGON_API_KEY as _CFG_POLY_KEY,   # kept for backward compat, but not read at import time
     ALPACA_KEY_ID,
     ALPACA_SECRET_KEY,
 )
@@ -35,10 +49,15 @@ except Exception:
     AlpacaTimeFrame = None  # type: ignore
 
 try:
-    # Polygon (official API client)
+    # Polygon (official API client) — we keep for options helpers below.
     from polygon import RESTClient as PolygonRESTClient
 except Exception:
     PolygonRESTClient = None  # type: ignore
+
+try:
+    import httpx
+except Exception:
+    httpx = None  # type: ignore
 
 
 # ---------------------------------------------------------------------
@@ -106,6 +125,10 @@ def _filter_rth_et(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[rth].reset_index(drop=True)
 
 
+def _empty_ohlcv_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+
+
 # ---------------------------------------------------------------------
 # Alpaca Stocks (minute bars)
 # ---------------------------------------------------------------------
@@ -128,7 +151,7 @@ def load_alpaca_minutes(symbol: str, start: str, end: str, rth_only: bool = True
     )
     out = client.get_stock_bars(req)
     if out is None or out.df is None or out.df.empty:
-        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+        return _empty_ohlcv_df()
 
     df = out.df.reset_index()
     df = df[df["symbol"] == symbol].copy()
@@ -140,46 +163,279 @@ def load_alpaca_minutes(symbol: str, start: str, end: str, rth_only: bool = True
 
 
 # ---------------------------------------------------------------------
-# Polygon Stocks (minute bars via Aggregates v2)
+# Polygon Stocks (minute bars via Aggregates v2) — ASYNC PARALLEL
 # ---------------------------------------------------------------------
-def load_polygon_minutes(symbol: str, start: str, end: str, adjusted: bool = True, rth_only: bool = True) -> pd.DataFrame:
-    """
-    Fetch 1-minute aggregates for [start, end] (UTC date strings ok) and return:
-      columns: timestamp(UTC tz-aware), open, high, low, close, volume
-    Requires POLYGON_API_KEY in config.py and `polygon-api-client` installed.
-    """
-    if PolygonRESTClient is None:
-        raise ImportError("polygon-api-client is not installed. pip install polygon-api-client")
 
-    client = PolygonRESTClient(api_key=POLYGON_API_KEY)
+# --- polygon: request builder ---
+_POLY_BASE = "https://api.polygon.io"
+_AGGS_PATH = "/v2/aggs/ticker/{ticker}/range/1/minute/{start}/{end}"
 
-    # Polygon aggregates v2; client paginates for you
-    rows: List[Dict[str, Any]] = []
-    for a in client.list_aggs(
+
+async def _poly_sleep_with_jitter(base: float) -> None:
+    await asyncio.sleep(base * (1.0 + random.random() * 0.25))
+
+
+# --- polygon: 429/backoff ---
+async def _req_with_backoff(
+    client: HTTPXAsyncClient,
+    url: str,
+    params: Dict[str, Any],
+    max_retries: int = 6,
+    base_delay: float = 0.8,
+) -> Optional[Dict[str, Any]]:
+    """
+    Perform GET with exponential backoff + jitter; respect Retry-After when present.
+    Returns parsed JSON dict or None on hard failure.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            resp = await client.get(url, params=params, timeout=60.0)
+        except Exception as e:
+            if attempt >= max_retries:
+                return None
+            await _poly_sleep_with_jitter(base_delay * (2 ** attempt))
+            continue
+
+        # Rate limit / server errors
+        if resp.status_code in (429, 500, 502, 503, 504):
+            if attempt >= max_retries:
+                return None
+            ra = resp.headers.get("Retry-After")
+            if ra:
+                try:
+                    await asyncio.sleep(float(ra))
+                except Exception:
+                    await _poly_sleep_with_jitter(base_delay * (2 ** attempt))
+            else:
+                await _poly_sleep_with_jitter(base_delay * (2 ** attempt))
+            continue
+
+        if not resp.is_success:
+            # Non-retryable HTTP
+            return None
+
+        try:
+            return resp.json()
+        except Exception:
+            return None
+
+    return None
+
+
+# --- polygon: pagination ---
+async def _fetch_polygon_minutes_pages(
+    client: HTTPXAsyncClient,
+    api_key: str,
+    symbol: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    adjusted: bool,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch all pages for aggregates v2 between [start, end] inclusive.
+    """
+    url = _POLY_BASE + _AGGS_PATH.format(
         ticker=symbol,
-        multiplier=1,
-        timespan="minute",
-        from_=pd.Timestamp(start, tz="UTC").strftime("%Y-%m-%d"),
-        to=pd.Timestamp(end,   tz="UTC").strftime("%Y-%m-%d"),
-        adjusted=adjusted,
-        sort="asc",
-        limit=50_000,
-    ):
-        rows.append({
-            "timestamp": pd.to_datetime(a.timestamp, unit="ms", utc=True),
-            "open": float(a.open),
-            "high": float(a.high),
-            "low": float(a.low),
-            "close": float(a.close),
-            "volume": float(a.volume),
-        })
+        start=start.strftime("%Y-%m-%d"),
+        end=end.strftime("%Y-%m-%d"),
+    )
+    params = {
+        "adjusted": "true" if adjusted else "false",
+        "sort": "asc",
+        "limit": 50_000,
+        "apiKey": api_key,
+    }
+
+    rows: List[Dict[str, Any]] = []
+    while True:
+        data = await _req_with_backoff(client, url, params)
+        if not data or "results" not in data:
+            break
+        res = data.get("results") or []
+        for a in res:
+            # Polygon returns 't' (ms) and o/h/l/c/v keys
+            rows.append({
+                "timestamp": pd.to_datetime(a.get("t"), unit="ms", utc=True),
+                "open": float(a.get("o", float("nan"))),
+                "high": float(a.get("h", float("nan"))),
+                "low":  float(a.get("l", float("nan"))),
+                "close":float(a.get("c", float("nan"))),
+                "volume": float(a.get("v", 0.0)),
+            })
+
+        nxt = data.get("next_url")
+        if not nxt:
+            break
+        # next_url already contains apiKey; keep using absolute path
+        url = nxt
+        params = {}  # already embedded
+
+    return rows
+
+
+# --- polygon: simple token bucket for soft RPM clamp ---
+class _TokenBucket:
+    def __init__(self, rpm: Optional[int] = None):
+        self.rpm = rpm
+        self.window = 60.0
+        self.times = deque()  # timestamps of recent requests
+        self.lock = asyncio.Lock()
+
+    async def throttle(self):
+        if not self.rpm:
+            return
+        async with self.lock:
+            now = time.monotonic()
+            # prune old
+            while self.times and (now - self.times[0]) > self.window:
+                self.times.popleft()
+            if len(self.times) >= self.rpm:
+                sleep_for = self.window - (now - self.times[0]) + 0.01
+                await asyncio.sleep(max(0.01, sleep_for))
+            self.times.append(time.monotonic())
+
+
+async def _load_one_symbol_polygon(
+    symbol: str,
+    start: str,
+    end: str,
+    rth_only: bool,
+    adjusted: bool,
+    api_key: str,
+    sem: asyncio.Semaphore,
+    bucket: _TokenBucket,
+    client: HTTPXAsyncClient,
+) -> Tuple[str, pd.DataFrame]:
+    # Guard inputs/timestamps
+    s_ts = pd.Timestamp(start, tz="UTC")
+    e_ts = pd.Timestamp(end, tz="UTC")
+    async with sem:
+        await bucket.throttle()
+        rows = await _fetch_polygon_minutes_pages(client, api_key, symbol, s_ts, e_ts, adjusted)
+
+    if not rows:
+        # Return empty with expected schema; caller logs WARN/QC decisions
+        return symbol, _empty_ohlcv_df()
 
     df = pd.DataFrame(rows)
-    if df.empty:
-        return df
+    # Deduplicate & sort
+    if not df.empty:
+        df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+    # --- polygon: RTH filter ---
     if rth_only:
-        df = _filter_rth_et(df)
-    return df.sort_values("timestamp").reset_index(drop=True)
+        rth_df = _filter_rth_et(df)
+        if rth_df.empty and not df.empty:
+            print(f"[WARN] {symbol}: empty after RTH; retrying without RTH")
+            return symbol, df  # fallback to ALL-hours without re-fetch
+        return symbol, rth_df
+
+    return symbol, df
+
+
+def _require_httpx():
+    if httpx is None:
+        raise ImportError("httpx is required for async Polygon loading. pip install httpx")
+
+
+def _resolve_polygon_api_key() -> str:
+    # No top-level fetch; do it here. Env var wins; fallback to config if set.
+    key = os.getenv("POLYGON_API_KEY") or (_CFG_POLY_KEY if _CFG_POLY_KEY else None)
+    if not key:
+        raise RuntimeError("Missing POLYGON_API_KEY. Set env var POLYGON_API_KEY before running.")
+    return key
+
+
+def load_polygon_minutes(
+    symbol: str,
+    start: str,
+    end: str,
+    adjusted: bool = True,
+    rth_only: bool = True,
+) -> pd.DataFrame:
+    """
+    Synchronous wrapper that uses async httpx under the hood.
+    Fetch 1-minute aggregates for [start, end] and return:
+      columns: timestamp(UTC tz-aware), open, high, low, close, volume
+    """
+    _require_httpx()
+    api_key = _resolve_polygon_api_key()
+
+    async def _runner() -> pd.DataFrame:
+        async with httpx.AsyncClient(base_url=_POLY_BASE, http2=True, timeout=60.0) as client:
+            sem = asyncio.Semaphore(1)  # single symbol
+            bucket = _TokenBucket(None) # no RPM cap for single
+            _, df = await _load_one_symbol_polygon(
+                symbol=symbol,
+                start=start,
+                end=end,
+                rth_only=rth_only,
+                adjusted=adjusted,
+                api_key=api_key,
+                sem=sem,
+                bucket=bucket,
+                client=client,
+            )
+            return df
+
+    return asyncio.run(_runner())
+
+
+def load_polygon_minutes_multi(
+    symbols: Iterable[str],
+    start: str,
+    end: str,
+    rth_only: bool = True,
+    adjusted: bool = True,
+    max_concurrency: int = 6,
+    reqs_per_min: Optional[int] = None,   # soft clamp; None disables
+) -> Dict[str, pd.DataFrame]:
+    """
+    Parallel Polygon loader across symbols with bounded concurrency and soft RPM cap.
+
+    Returns dict: {symbol -> DataFrame}
+    """
+    _require_httpx()
+    api_key = _resolve_polygon_api_key()
+    syms = [s.strip().upper() for s in symbols if s and s.strip()]
+    if not syms:
+        return {}
+
+    async def _runner() -> Dict[str, pd.DataFrame]:
+        out: Dict[str, pd.DataFrame] = {}
+        sem = asyncio.Semaphore(max(1, int(max_concurrency)))
+        bucket = _TokenBucket(rpm=reqs_per_min)
+
+        async with httpx.AsyncClient(base_url=_POLY_BASE, http2=True, timeout=60.0) as client:
+            tasks = [
+                _load_one_symbol_polygon(
+                    symbol=s,
+                    start=start,
+                    end=end,
+                    rth_only=rth_only,
+                    adjusted=adjusted,
+                    api_key=api_key,
+                    sem=sem,
+                    bucket=bucket,
+                    client=client,
+                )
+                for s in syms
+            ]
+            for coro in asyncio.as_completed(tasks):
+                try:
+                    sym, df = await coro
+                except Exception as e:
+                    # Hard failure for this symbol: log WARN and return empty df
+                    # (Do not abort global run)
+                    msg = str(e)
+                    print(f"[WARN] {getattr(e, '__class__', type('E', (), {})).__name__}: {msg}")
+                    # We don't know which sym if the exception fired before tuple return; skip
+                    continue
+                out[sym] = df if df is not None else _empty_ohlcv_df()
+
+        return out
+
+    return asyncio.run(_runner())
 
 
 # ---------------------------------------------------------------------
@@ -203,14 +459,13 @@ def polygon_options_chain_snapshot(
     if PolygonRESTClient is None:
         raise ImportError("polygon-api-client is not installed. pip install polygon-api-client")
 
-    client = PolygonRESTClient(api_key=POLYGON_API_KEY)
+    client = PolygonRESTClient(api_key=(os.getenv("POLYGON_API_KEY") or _CFG_POLY_KEY))
 
     items = client.list_snapshot_options_chain(underlying)  # iterable of option snapshot items
 
     now_utc = pd.Timestamp.utcnow().tz_localize("UTC")
     rows: List[Dict[str, Any]] = []
     for o in items:
-        # defensive getattr to handle schema variations
         det = getattr(o, "details", None)
         greeks = getattr(o, "greeks", None)
         last_q = getattr(o, "last_quote", None)
@@ -224,11 +479,9 @@ def polygon_options_chain_snapshot(
         if not tkr or not exp:
             continue
 
-        # filter by contract_type if provided
         if contract_type and str(ctype).lower() != contract_type.lower():
             continue
 
-        # DTE filter
         try:
             exp_ts = pd.Timestamp(exp).tz_localize("UTC")
             dte = (exp_ts - now_utc).days
@@ -240,7 +493,6 @@ def polygon_options_chain_snapshot(
         if max_dte is not None and (dte is None or dte > max_dte):
             continue
 
-        # quotes/price
         bid = getattr(getattr(last_q, "bid", None), "price", None)
         ask = getattr(getattr(last_q, "ask", None), "price", None)
         mid = None
@@ -283,7 +535,6 @@ def polygon_options_chain_snapshot(
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    # normalize types
     df["expiration_date"] = pd.to_datetime(df["expiration_date"], utc=True, errors="coerce")
     df["updated_at"] = pd.to_datetime(df["updated_at"], utc=True, errors="coerce")
     return df.sort_values(["expiration_date","strike"]).reset_index(drop=True)
@@ -310,7 +561,6 @@ def choose_bear_call_spread_polygon(
     if chain.empty:
         return None
 
-    # choose short leg: closest |delta| to target_delta, above-the-money strikes preferred
     sel = chain.dropna(subset=["delta","strike","expiration_date"]).copy()
     if sel.empty:
         return None
@@ -322,7 +572,6 @@ def choose_bear_call_spread_polygon(
     same_exp = chain[(chain["expiration_date"] == short_leg["expiration_date"]) &
                      (chain["strike"] > short_leg["strike"])].copy()
     if same_exp.empty:
-        # fallback: pick any farther strike in later rows
         same_exp = chain[chain["strike"] > short_leg["strike"]].copy()
 
     long_leg = same_exp.iloc[0].to_dict() if not same_exp.empty else None
@@ -344,7 +593,7 @@ def load_polygon_option_aggregates(
     if PolygonRESTClient is None:
         raise ImportError("polygon-api-client is not installed. pip install polygon-api-client")
 
-    client = PolygonRESTClient(api_key=POLYGON_API_KEY)
+    client = PolygonRESTClient(api_key=(os.getenv("POLYGON_API_KEY") or _CFG_POLY_KEY))
 
     rows: List[Dict[str, Any]] = []
     for a in client.list_aggs(
@@ -373,7 +622,7 @@ def load_polygon_option_aggregates(
 
 
 # ---------------------------------------------------------------------
-# Convenience: simple monthly backfill helpers (can be called from tiny scripts)
+# Convenience: simple monthly backfill helpers
 # ---------------------------------------------------------------------
 def backfill_month_with_loader(
     loader_fn,
