@@ -10,3 +10,4 @@ data/**/*.parquet
 # log/noise
 *.log
 jupyter.log
+reports/
