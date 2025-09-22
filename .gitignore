@@ -1,13 +1,18 @@
-.venv/
+# Python
 __pycache__/
-*.nbi
-*.nbc
+*.pyc
+.venv/
+venv/
+.env
+.env.*
 
-# local data cache
-data/minute_bars/
-data/**/*.parquet
-
-# log/noise
-*.log
-jupyter.log
+# Data & outputs
 reports/
+logs/
+*.log
+.ipynb_checkpoints/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,20 @@
+Baseline dir:  reports/20250922_001520Z_simple6m_baseline
+Optimizer dir: reports/20250921_230534Z_simple6m_opt5
+
+[Presence] baseline:
+  summary.csv          ok
+  bot_summary.json     ok
+  run_meta.json        ok
+  trades.csv           ok
+  window_pnl.csv       ok
+  error.log            absent
+[Presence] optimizer:
+  summary.csv          ok
+  bot_summary.json     ok
+  run_meta.json        ok
+  trades.csv           ok
+  opt_window_pnl.csv   ok
+  error.log            absent
+
+[Floors] baseline: {"status": "breach", "breaches": ["train_trades<5: 4 rows", "test_trades<3: 4 rows"]}
+[Floors] optimizer: {"status": "breach", "breaches": ["train_trades<5: 4 rows", "test_trades<3: 4 rows"]}
