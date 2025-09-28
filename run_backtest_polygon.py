@@ -4,7 +4,7 @@
 # Polygon path includes monthly-chunk prefetch + resilient monkeypatch.
 # Also supports --use-optimized to apply best_params from summary.csv before reporting.
 
-import argparse, os, json, warnings, time
+import argparse, os, json, warnings, time, zipfile
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
@@ -174,6 +174,28 @@ def _prepare_symbol_df(df: pd.DataFrame, symbol: str, base: Params) -> pd.DataFr
 
 # --- run dir/meta -------------------------------------------------------------
 def _make_run_dir(base_reports_dir: str, run_tag: str | None = None):
+def _make_run_dir_shared(base_reports_dir: str, args):
+    """
+    If args.run_root is set, use reports/<run_root>/<run_root>_s<index> (or <run_root> if non-sharded).
+    Otherwise fall back to _make_run_dir().
+    Returns (run_dir, run_id, now_utc, parent_dir).
+    """
+    now_utc = datetime.now(timezone.utc)
+    if getattr(args, "run_root", None):
+        root = os.path.join(base_reports_dir, args.run_root)
+        os.makedirs(root, exist_ok=True)
+        if args.shard_index is not None and args.shard_count and args.shard_count > 1:
+            child = f"{args.run_root}_s{args.shard_index}"
+        else:
+            child = args.run_root
+        run_dir = os.path.join(root, child)
+        os.makedirs(run_dir, exist_ok=True)
+        # run_id becomes the child folder name to keep per-run uniqueness stable
+        return run_dir, child, now_utc, root
+    # default behavior
+    run_dir, run_id, now_utc = _make_run_dir(base_reports_dir, getattr(args, "run_tag", None))
+    return run_dir, run_id, now_utc, os.path.dirname(run_dir)
+
     now_utc = datetime.now(timezone.utc)
     run_id = now_utc.strftime("%Y%m%d_%H%M%SZ")
     if run_tag:
@@ -304,6 +326,10 @@ def main():
                     help="Max concurrent Polygon requests (default 6)")
     ap.add_argument("--polygon-reqs-per-min", type=int, default=100,
                     help="Soft RPM clamp for Polygon (default 100)")
+    ap.add_argument("--run-root", type=str, default=os.environ.get("RUN_ROOT_ID"),
+                    help="Shared parent folder under reports/ for multi-shard runs; child = \"<run-root>_s<index>\"")
+    ap.add_argument("--auto-zip", action="store_true",
+                    help="When using --run-root with shards, zip the parent once all shard folders exist")
 
     args = ap.parse_args()
     # --- grid override via env (monkeypatch optimizer._full_grid) ---
@@ -439,7 +465,7 @@ def main():
 
     # Make run folder & alert channel
     os.makedirs(REPORTS_DIR, exist_ok=True)
-    run_dir, run_id, now_utc = _make_run_dir(REPORTS_DIR, args.run_tag)
+    run_dir, run_id, now_utc, _parent_dir = _make_run_dir_shared(REPORTS_DIR, args)
     alert = AlertManager(run_dir)
     alp_guard = RateLimitGuard("Alpaca", args.alpaca_limit if args.alpaca_limit > 0 else None, alert)
     pol_guard = RateLimitGuard("Polygon", args.polygon_limit if args.polygon_limit > 0 else None, alert)
@@ -697,6 +723,34 @@ def main():
     print("  - trades.csv (if any)")
     print("  - run_meta.json")
     print("  - quick_report.pdf (unless --no-report)")
+    # --- auto-zip parent when all shard folders exist ---
+    try:
+        if getattr(args, "auto-zip", False) or getattr(args, "auto_zip", False):
+            if getattr(args, "run_root", None) and args.shard_index is not None and args.shard_count:
+                expected = [os.path.join(_parent_dir, f"{args.run_root}_s{i}") for i in range(int(args.shard_count))]
+                if all(os.path.isdir(d) for d in expected):
+                    lock_path = os.path.join(_parent_dir, ".zip.lock")
+                    try:
+                        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                        os.close(fd)
+                        zip_path = os.path.join(REPORTS_DIR, f"{args.run_root}.zip")
+                        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                            for root, _, files in os.walk(_parent_dir):
+                                for fn in files:
+                                    # skip lock file and nested zips if any
+                                    if fn.endswith(".lock") or (fn.endswith(".zip") and root == REPORTS_DIR):
+                                        continue
+                                    fp = os.path.join(root, fn)
+                                    arc = os.path.relpath(fp, REPORTS_DIR)
+                                    zf.write(fp, arcname=arc)
+                        print(f"[bundle] Created parent zip: {zip_path}")
+                    finally:
+                        try: os.unlink(lock_path)
+                        except: pass
+    except Exception as _zip_e:
+        print(f"[WARN] auto-zip failed: {_zip_e}")
+    # --- /auto-zip ---
+
 
 
 if __name__ == "__main__":
