@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # Exuberance Fade Backtester — cleaned & guarded
 # Implements RTH helper + shard slicing guard + window QC logging.
+# Polygon path includes monthly-chunk prefetch + resilient monkeypatch.
+# Also supports --use-optimized to apply best_params from summary.csv before reporting.
 
-import argparse, os, json, warnings, time
+import argparse, os, json, warnings, time, zipfile
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
@@ -12,14 +14,22 @@ import pandas as pd
 import pytz
 from tqdm import tqdm
 
-# Project imports (unchanged)
+# Project imports
 from config import DATA_DIR, REPORTS_DIR, DEFAULT_SYMBOLS
 from data_ingest import (
     load_local_parquet,
     generate_synthetic_minutes,
     load_alpaca_minutes,
-    load_polygon_minutes,
 )
+# Polygon parallel + original single-symbol loader
+from data_ingest import load_polygon_minutes_multi
+from data_ingest import load_polygon_minutes as _orig_load_polygon_minutes
+
+# Provide a GLOBAL default name that other helpers can call.
+# We may overwrite this symbol later (monkeypatch) after args are parsed.
+def load_polygon_minutes(symbol, *args, **kwargs):
+    return _orig_load_polygon_minutes(symbol, *args, **kwargs)
+
 from signals import (
     add_intraday_features,
     signal_gap_fade,
@@ -36,13 +46,11 @@ from reporter import generate_quick_report
 # --- warnings control ---------------------------------------------------------
 warnings.filterwarnings("ignore", message="DataFrameGroupBy.apply")
 warnings.filterwarnings("ignore", message="Converting to PeriodArray/Index representation will drop timezone information")
+QC_MIN_SYMS_DEFAULT = int(os.environ.get("QC_MIN_SYMS", "1"))
 
 # --- utils: timestamp normalization ------------------------------------------
 def _resolve_ts_column(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
-    """
-    Find a timestamp column among common names or an index.
-    Return (df_with_ts_column, ts_col_name). Ensures tz-aware UTC dtype.
-    """
+    """Find a timestamp column among common names or an index. Ensures tz-aware UTC dtype."""
     candidates = ["ts", "timestamp", "time", "datetime", "date", "t", "bar_time"]
     tscol = None
     for c in candidates:
@@ -69,10 +77,7 @@ def _resolve_ts_column(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
 
 
 def _month_keys(df: pd.DataFrame, tscol: str) -> pd.Series:
-    """
-    Safe month bucketing that avoids tz warnings:
-      UTC -> naive -> to_period('M') -> str
-    """
+    """UTC -> naive -> to_period('M') -> str to avoid tz warnings."""
     return (
         df[tscol]
         .dt.tz_convert("UTC")
@@ -83,10 +88,7 @@ def _month_keys(df: pd.DataFrame, tscol: str) -> pd.Series:
 
 # --- RTH helper ---------------------------------------------------------------
 def _apply_rth_et(df: pd.DataFrame, *, log_prefix: str) -> pd.DataFrame:
-    """
-    Convert the timestamp to America/New_York and keep Monday–Friday 09:30–16:00 ET.
-    If the resulting frame is empty, the caller should fall back to non-RTH.
-    """
+    """Keep Monday–Friday 09:30–16:00 ET; warn + expect fallback if empty."""
     df, ts = _resolve_ts_column(df)
     et = df[ts].dt.tz_convert("America/New_York")
     mins = et.dt.hour * 60 + et.dt.minute
@@ -110,7 +112,7 @@ def _load_symbol_data(symbol: str, start: str, end: str, source: str,
             alp_guard.record(1)
             return df
         elif source == "polygon":
-            df = load_polygon_minutes(symbol, start, end, rth_only=False)
+            df = load_polygon_minutes(symbol, start, end, rth_only=False)  # monkeypatched name
             pol_guard.record(1)
             return df
         else:
@@ -142,18 +144,14 @@ def _normalize_symbols(sym_in) -> List[str]:
 
 
 def symbols_for_shard(all_symbols, shard_index: int | None, shard_count: int | None) -> List[str]:
-    """
-    Deterministically slice by position: idx % shard_count == shard_index
-    """
+    """Deterministically slice by position: idx % shard_count == shard_index"""
     full = _normalize_symbols(all_symbols)
     if not full:
         raise SystemExit("Error: parsed symbol list is empty.")
-
     if shard_index is None or shard_count is None or shard_count <= 1:
         out = full
     else:
         out = [s for idx, s in enumerate(full) if idx % shard_count == shard_index]
-
     print(f"[shard {shard_index}/{shard_count}] symbols: {out}")
     if len(out) == 0:
         raise SystemExit("Shard produced zero symbols. Check --shard-index/--shard-count and --symbols.")
@@ -164,11 +162,10 @@ def symbols_for_shard(all_symbols, shard_index: int | None, shard_count: int | N
 def _prepare_symbol_df(df: pd.DataFrame, symbol: str, base: Params) -> pd.DataFrame:
     df = df.copy()
     df["symbol"] = symbol
-    # prefer explicit timestamp column if present; else preserve order
     tscol = "timestamp" if "timestamp" in df.columns else df.columns[0]
     df = df.sort_values(tscol)
-    df = add_intraday_features(df)  # rsi, sigma, vwap_dev, vwap
-    df = minute_volume_profile_flag(df, multiple=3.0)  # vol_mult
+    df = add_intraday_features(df)
+    df = minute_volume_profile_flag(df, multiple=3.0)
     df = signal_gap_fade(df, gap_th=base.gap_th, hold_minutes=base.hold_minutes)
     df = signal_vwap_extreme(df, z_th=base.vwap_z, rsi_th=base.rsi_th)
     df = signal_late_blowoff(df, breakout_pct=base.breakout_pct)
@@ -177,7 +174,29 @@ def _prepare_symbol_df(df: pd.DataFrame, symbol: str, base: Params) -> pd.DataFr
 
 # --- run dir/meta -------------------------------------------------------------
 def _make_run_dir(base_reports_dir: str, run_tag: str | None = None):
-    now_utc = datetime.now(timezone.utc)  # timezone-aware (no deprecation)
+def _make_run_dir_shared(base_reports_dir: str, args):
+    """
+    If args.run_root is set, use reports/<run_root>/<run_root>_s<index> (or <run_root> if non-sharded).
+    Otherwise fall back to _make_run_dir().
+    Returns (run_dir, run_id, now_utc, parent_dir).
+    """
+    now_utc = datetime.now(timezone.utc)
+    if getattr(args, "run_root", None):
+        root = os.path.join(base_reports_dir, args.run_root)
+        os.makedirs(root, exist_ok=True)
+        if args.shard_index is not None and args.shard_count and args.shard_count > 1:
+            child = f"{args.run_root}_s{args.shard_index}"
+        else:
+            child = args.run_root
+        run_dir = os.path.join(root, child)
+        os.makedirs(run_dir, exist_ok=True)
+        # run_id becomes the child folder name to keep per-run uniqueness stable
+        return run_dir, child, now_utc, root
+    # default behavior
+    run_dir, run_id, now_utc = _make_run_dir(base_reports_dir, getattr(args, "run_tag", None))
+    return run_dir, run_id, now_utc, os.path.dirname(run_dir)
+
+    now_utc = datetime.now(timezone.utc)
     run_id = now_utc.strftime("%Y%m%d_%H%M%SZ")
     if run_tag:
         run_id = f"{run_id}_{run_tag}"
@@ -210,53 +229,66 @@ def _estimate_runtime_seconds(dfs: Dict[str, pd.DataFrame], base: Params, units:
 
 # --- window QC logging --------------------------------------------------------
 def _qc_train_test_counts(dfs: Dict[str, pd.DataFrame], train_m: int, test_m: int,
-                          rth_used: Dict[str, bool]) -> Tuple[Dict[str, Tuple[int,int]], int, List[str]]:
+                          rth_used: Dict[str, bool], qc_mode: str = "common") -> Tuple[Dict[str, Tuple[int,int]], int, List[str]]:
+    """Return per-symbol (train_bars, test_bars), window count, and test month using a quorum rule.
+    If qc_mode == "common": require all symbols to have the test month; otherwise use a quorum threshold
+    read from env QC_MIN_SYMS (default 1). This only affects QC logging + optional dropping, not the optimizer windows.
     """
-    Returns:
-      per_sym_counts: {sym: (train_bars, test_bars)}
-      windows_count:  int
-      test_months:    ['YYYY-MM', ...]
-    """
-    # Union of month keys across symbols
-    all_months = set()
-    per_sym_month = {}
+    # per-symbol month sets
+    per_months: Dict[str, set] = {}
     for sym, df in dfs.items():
         df, ts = _resolve_ts_column(df)
         months = _month_keys(df, ts)
-        per_sym_month[sym] = months
-        all_months |= set(months.unique())
+        per_months[sym] = set(months.dropna().unique())
 
-    sorted_months = sorted(all_months)
-    windows_count = max(0, len(sorted_months) - train_m - test_m + 1)
-    if len(sorted_months) >= test_m:
-        test_months = sorted_months[-test_m:]
+    # newest-first candidate months (union)
+    candidates = sorted(set().union(*per_months.values()) if per_months else [], reverse=True)
+
+    # threshold
+    if qc_mode == "common":
+        thresh = len(per_months) if per_months else 0
     else:
-        test_months = []
+        thresh = max(1, QC_MIN_SYMS_DEFAULT)
 
-    per_counts = {}
+    # pick newest month that >= thresh symbols actually have
+    test_months: List[str] = []
+    for m in candidates:
+        have = sum(1 for s in per_months if m in per_months[s])
+        if have >= thresh:
+            test_months = [m] if test_m > 0 else []
+            break
+
+    # info only (not used to split windows)
+    sorted_months = sorted(set().union(*per_months.values())) if per_months else []
+    windows_count = max(0, len(sorted_months) - train_m - test_m + 1)
+
+    # per-symbol counts
+    per_counts: Dict[str, Tuple[int,int]] = {}
     for sym, df in dfs.items():
         if df.empty:
             per_counts[sym] = (0, 0)
             print(f"[QC] {sym}: train_bars=0 test_bars=0 (after {'RTH' if rth_used.get(sym, False) else 'ALL'})")
             continue
         df, ts = _resolve_ts_column(df)
-        m = _month_keys(df, ts)
-        test_mask = m.isin(test_months)
-        train_mask = m.isin(sorted_months[:-test_m]) if test_m > 0 else m.notna()
+        mser = _month_keys(df, ts)
+
+        test_mask = mser.isin(test_months) if test_months else mser == "__none__"
+        if test_months:
+            edge = test_months[0]
+            train_mask = mser < edge
+        else:
+            train_mask = mser.notna()
+
         train_bars = int(train_mask.sum())
-        test_bars = int(test_mask.sum())
+        test_bars  = int(test_mask.sum())
         tag = "RTH" if rth_used.get(sym, False) else "ALL"
-        print(f"[QC] {sym}: train_bars={train_bars} test_bars={test_bars} (after {tag})")
+        print(f"[QC] {sym}: train_bars={train_bars} test_bars={test_bars} (after {tag}; test_month={test_months[0] if test_months else 'none'}; thresh={thresh})")
         per_counts[sym] = (train_bars, test_bars)
 
-    # Skip symbols with zero test bars
     return per_counts, windows_count, test_months
 
-
-# --- main --------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="Exuberance Fade Backtester")
-    # CLI
     ap.add_argument("--symbols", nargs="*", default=DEFAULT_SYMBOLS,
                     help="Space or comma separated; quotes OK, e.g. 'MSFT AVGO' or 'MSFT,AVGO'")
     ap.add_argument("--source", default="local", choices=["local", "alpaca", "polygon"])
@@ -273,31 +305,172 @@ def main():
     ap.add_argument("--fast", action="store_true")
     ap.add_argument("--max-combos", type=int, default=None)
     ap.add_argument("--train-months", type=int, default=None)
-    ap.add_argument("--test-months",  type=int, default=None)  # type: ignore[assignment]
+    ap.add_argument("--test-months",  type=int, default=None)
 
     ap.add_argument("--write-cache", action="store_true")
     ap.add_argument("--run-tag", type=str, default=None)
 
-    # rate-limit knobs
     ap.add_argument("--alpaca-limit", type=int, default=200)
     ap.add_argument("--polygon-limit", type=int, default=60)
 
     ap.add_argument("--warn-runtime-mins", type=float, default=15.0)
+    ap.add_argument("--qc-mode", type=str, default="common", choices=["common","union","off"],
+                    help="Month alignment for QC: common=intersection, union=union, off=don\'t drop symbols")
     ap.add_argument("--no-report", action="store_true")
 
-    ap.add_argument("--use-optimized", action="store_true", default=False,                    help="Re-sim with best params from summary.csv before writing report")
-    ap.add_argument("--min-rth-bars-per-day", type=int, default=0,                    help="Drop US/Eastern days with fewer than N RTH minute bars (0=off)")
+    ap.add_argument("--use-optimized", action="store_true", default=False,
+                    help="Re-sim with best params from summary.csv before writing report")
+    ap.add_argument("--min-rth-bars-per-day", type=int, default=0,
+                    help="Drop US/Eastern days with fewer than N RTH minute bars (0=off)")
+    ap.add_argument("--polygon-max-concurrency", type=int, default=6,
+                    help="Max concurrent Polygon requests (default 6)")
+    ap.add_argument("--polygon-reqs-per-min", type=int, default=100,
+                    help="Soft RPM clamp for Polygon (default 100)")
+    ap.add_argument("--run-root", type=str, default=os.environ.get("RUN_ROOT_ID"),
+                    help="Shared parent folder under reports/ for multi-shard runs; child = \"<run-root>_s<index>\"")
+    ap.add_argument("--auto-zip", action="store_true",
+                    help="When using --run-root with shards, zip the parent once all shard folders exist")
+
     args = ap.parse_args()
+    # --- grid override via env (monkeypatch optimizer._full_grid) ---
+    import os
+    try:
+        import optimizer as _opt
+        if hasattr(_opt, "_full_grid"):
+            _orig_full_grid = _opt._full_grid
+            def _parse_env_list(name: str):
+                v = os.environ.get(name)
+                if not v: return None
+                parts = [t.strip() for t in v.replace(";",",").split(",") if t.strip()]
+                out = []
+                for t in parts:
+                    try: out.append(float(t))
+                    except: out.append(t)
+                return out
+            def _patched_full_grid():
+                g = _orig_full_grid()
+                overrides = {
+                    "take_profit_sigma": _parse_env_list("GRID_TAKE_PROFIT_SIGMA"),
+                    "stop_loss_pct":     _parse_env_list("GRID_STOP_LOSS_PCT"),
+                    "vol_mult_th":       _parse_env_list("GRID_VOL_MULT_TH"),
+                    "vwap_z":            _parse_env_list("GRID_VWAP_Z"),
+                    "stake_pct":         _parse_env_list("GRID_STAKE_PCT"),
+                }
+                overrides = {k:v for k,v in overrides.items() if v is not None}
+                if overrides:
+                    g.update(overrides)
+                    print("[grid override]", overrides)
+                return g
+            _opt._full_grid = _patched_full_grid
+    except Exception as e:
+        print(f"[WARN] grid override patch failed: {e}")
+    # --- /grid override ---
+
+
+    # --- polygon: global prefetch + monkeypatch ---
+    try:
+        _polygon_frames = None
+        if getattr(args, "source", "local") == "polygon":
+            # normalize symbols (commas & whitespace)
+            _symbols_list = []
+            _syms = getattr(args, "symbols", [])
+            if isinstance(_syms, (list, tuple)):
+                for x in _syms:
+                    for tok in str(x).replace(",", " ").split():
+                        if tok.strip():
+                            _symbols_list.append(tok.strip().upper())
+            elif isinstance(_syms, str):
+                _symbols_list = [t.strip().upper() for t in _syms.replace(",", " ").split() if t.strip()]
+            if not _symbols_list:
+                raise RuntimeError("No symbols parsed for Polygon prefetch")
+
+            from pandas.tseries.offsets import MonthEnd
+            import pandas as _pd
+            start_ts = _pd.Timestamp(args.start, tz="UTC").normalize()
+            end_ts   = _pd.Timestamp(args.end,   tz="UTC").normalize()
+            months = list(_pd.period_range(start_ts.to_period("M"), end_ts.to_period("M"), freq="M"))
+
+            _acc = {s: [] for s in _symbols_list}
+            for per in months:
+                m_start = _pd.Timestamp(f"{per.year}-{per.month:02d}-01", tz="UTC")
+                m_end   = (m_start + MonthEnd(1)).normalize() + _pd.Timedelta(hours=23, minutes=59, seconds=59)
+
+                for sym in _symbols_list:
+                    # first attempt: single-symbol fetch (avoid cross-symbol paging races)
+                    part = load_polygon_minutes_multi(
+                        [sym],
+                        m_start.isoformat(),
+                        m_end.isoformat(),
+                        rth_only=getattr(args, "rth_only", True),
+                        adjusted=False,   # raw to match Alpaca
+                        max_concurrency=1,
+                        reqs_per_min=int(getattr(args, "polygon_reqs_per_min", 60)),
+                    ).get(sym)
+
+                    # lightweight completeness check (forgiving threshold)
+                    need_retry = False
+                    if part is not None and not part.empty:
+                        et = part["timestamp"].dt.tz_convert("US/Eastern")
+                        n_days = max(1, et.dt.normalize().nunique())
+                        if len(part) < max(300 * n_days, 3500):
+                            need_retry = True
+                    else:
+                        need_retry = True
+
+                    if need_retry:
+                        # gentle retry with lower RPM
+                        part = load_polygon_minutes_multi(
+                            [sym],
+                            m_start.isoformat(),
+                            m_end.isoformat(),
+                            rth_only=getattr(args, "rth_only", True),
+                            adjusted=False,
+                            max_concurrency=1,
+                            reqs_per_min=min(40, int(getattr(args, "polygon_reqs_per_min", 60))),
+                        ).get(sym)
+
+                    if part is not None and not part.empty:
+                        _acc[sym].append(part)
+
+                print(f"[polygon] month {per} fetched (per-symbol); rows by sym:",
+                      {k: sum(len(x) for x in v) for k, v in _acc.items()})
+
+            # assemble final per-symbol frames
+            _polygon_frames = {}
+            for sym, parts in _acc.items():
+                if parts:
+                    df = _pd.concat(parts, ignore_index=True)
+                    if "timestamp" in df.columns:
+                        df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
+                    _polygon_frames[sym] = df.reset_index(drop=True)
+                else:
+                    _polygon_frames[sym] = _pd.DataFrame()
+
+        else:
+            _polygon_frames = None
+
+        # expose loader that returns prefetched frames when available
+        global load_polygon_minutes
+        def load_polygon_minutes(symbol, *args2, **kwargs2):
+            if _polygon_frames is not None and isinstance(symbol, str):
+                _sym = symbol.strip().upper()
+                _df = _polygon_frames.get(_sym)
+                if _df is not None and not _df.empty:
+                    return _df
+            return _orig_load_polygon_minutes(symbol, *args2, **kwargs2)
+
+    except Exception as _e:
+        print(f"[WARN] polygon prefetch/monkeypatch failed: {_e} (falling back to per-call loader)")
+    # --- /polygon: global prefetch + monkeypatch ---
 
     # Make run folder & alert channel
     os.makedirs(REPORTS_DIR, exist_ok=True)
-    run_dir, run_id, now_utc = _make_run_dir(REPORTS_DIR, args.run_tag)
+    run_dir, run_id, now_utc, _parent_dir = _make_run_dir_shared(REPORTS_DIR, args)
     alert = AlertManager(run_dir)
     alp_guard = RateLimitGuard("Alpaca", args.alpaca_limit if args.alpaca_limit > 0 else None, alert)
     pol_guard = RateLimitGuard("Polygon", args.polygon_limit if args.polygon_limit > 0 else None, alert)
 
     # --- shard slicing guard ---
-    # (also satisfies robust symbol parsing requirement)
     shard_syms = symbols_for_shard(args.symbols, args.shard_index, args.shard_count)
 
     base = Params()
@@ -314,7 +487,6 @@ def main():
             if args.rth_only:
                 df_rth = _apply_rth_et(raw, log_prefix=sym)
                 if df_rth.empty:
-                    # fallback to NON-RTH for this symbol+window
                     df = raw
                     rth_used[sym] = False
                 else:
@@ -336,7 +508,6 @@ def main():
 
     if not dfs:
         print("[SKIP] All symbols empty after load/RTH; nothing to run for this shard/window.")
-        # Still write run_meta for traceability
         run_meta = {
             "run_id": run_id,
             "time_utc": now_utc.isoformat(),
@@ -357,14 +528,15 @@ def main():
         print(f"Done. Run folder: {run_dir}")
         return
 
-    # 2) Window QC (train/test bar counts & gating)  ---------------------------
+    # 2) Window QC -------------------------------------------------------------
     train_m = 1 if args.fast else (args.train_months or 2)
     test_m  = args.test_months or 1
 
-    per_counts, windows_count, test_months = _qc_train_test_counts(dfs, train_m, test_m, rth_used)
+    per_counts, windows_count, test_months = _qc_train_test_counts(dfs, train_m, test_m, rth_used, qc_mode=getattr(args, "qc_mode", "common"))
 
-    # Drop symbols with zero test bars
     drop = [s for s,(trb, teb) in per_counts.items() if teb == 0]
+    if args.qc_mode in ("off","union"):
+        drop = []
     if drop:
         print(f"[INFO] Dropping symbols with zero test bars this window: {drop}")
         for s in drop:
@@ -372,7 +544,6 @@ def main():
 
     if not dfs:
         print("[SKIP] No symbols with test bars after filters; skipping optimizer & sim for this shard/window.")
-        # Write a minimal run_meta and exit
         run_meta = {
             "run_id": run_id,
             "time_utc": now_utc.isoformat(),
@@ -396,7 +567,7 @@ def main():
 
     kept_syms = list(dfs.keys())
 
-    # 3) Runtime estimate & advisory (optional) --------------------------------
+    # 3) Runtime estimate ------------------------------------------------------
     if args.no_opt:
         units = 1
     else:
@@ -414,7 +585,7 @@ def main():
         alert.warn(f"Predicted runtime ~ {pred_sec/60:.1f} min "
                    f"(units={units}, windows={windows_count}, symbols={len(dfs)}). Consider scaling out.")
 
-    # 4) Optimizer (runs only if we actually have bars) ------------------------
+    # 4) Optimizer -------------------------------------------------------------
     if not args.no_opt:
         wf = walk_forward(
             dfs_by_symbol=dfs,
@@ -425,7 +596,7 @@ def main():
             max_combos=args.max_combos,
             reports_dir=run_dir,
             show_progress=True,
-            progress_log=True,          # <-- helps verify "Optimizer total: >0%"
+            progress_log=True,
             shard_index=args.shard_index,
             shard_count=args.shard_count,
             seed=args.seed,
@@ -435,11 +606,10 @@ def main():
         # --- use-optimized(best_params) ---
         if getattr(args, "use_optimized", False):
             try:
-                import os, json, ast
+                import ast, csv
                 import pandas as _pd
                 from dataclasses import fields as _fields
                 _summ = _pd.read_csv(os.path.join(run_dir, "summary.csv"))
-                # choose "best" row
                 _keys = ["test_total_pnl","test_pnl","objective","score","val_score","val_pnl","mean_test_pnl"]
                 for _k in _keys:
                     if _k in _summ.columns:
@@ -447,8 +617,6 @@ def main():
                         break
                 else:
                     _row = _summ.iloc[0]
-
-                # parse best_params column if present
                 _bp_raw = _row.get("best_params", None)
                 _bp_dict = {}
                 if isinstance(_bp_raw, dict):
@@ -461,17 +629,15 @@ def main():
                             _bp_dict = ast.literal_eval(_bp_raw)
                         except Exception:
                             _bp_dict = {}
-                # snapshot raw best_params
                 try:
                     with open(os.path.join(run_dir, "best_params.json"), "w") as _f:
                         json.dump(_bp_dict, _f, indent=2)
                 except Exception:
                     pass
 
-                # synonyms & casting to Params types
-                from dataclasses import asdict
                 _syn = {"z_th":"vwap_z","hold":"hold_minutes","hold_mins":"hold_minutes","timeout":"hold_minutes"}
-                _field_types = {f.name: f.type for f in _fields(Params)}
+                from dataclasses import fields as _fields2
+                _field_types = {f.name: f.type for f in _fields2(Params)}
                 _kw = {}
                 for k,v in list(_bp_dict.items()):
                     name = _syn.get(k, k)
@@ -491,10 +657,17 @@ def main():
                     base = Params(**{**_before, **_kw})
                     _changed = {k: (_before.get(k), _kw[k]) for k in _kw if _before.get(k) != _kw[k]}
                     print("[use-optimized] Applied best_params:", _changed if _changed else "(no material deltas)")
-                    # write applied params snapshot
                     try:
                         with open(os.path.join(run_dir, "best_params_applied.json"), "w") as _f:
                             json.dump(_kw, _f, indent=2)
+                    except Exception:
+                        pass
+                    try:
+                        m = _pd.read_csv(os.path.join(run_dir, "metrics_summary.csv")).set_index("metric")["value"].to_dict() if os.path.exists(os.path.join(run_dir, "metrics_summary.csv")) else {}
+                        row = {**{k:_kw.get(k) for k in sorted(_kw)}, **{'total_pnl': m.get('total_pnl'), 'hit_rate': m.get('hit_rate'), 'win_loss_ratio': m.get('win_loss_ratio')}}
+                        with open(os.path.join(run_dir, "best_params_summary.csv"), "w", newline="") as f:
+                            w = csv.DictWriter(f, fieldnames=list(row.keys()))
+                            w.writeheader(); w.writerow(row)
                     except Exception:
                         pass
                 else:
@@ -550,6 +723,34 @@ def main():
     print("  - trades.csv (if any)")
     print("  - run_meta.json")
     print("  - quick_report.pdf (unless --no-report)")
+    # --- auto-zip parent when all shard folders exist ---
+    try:
+        if getattr(args, "auto-zip", False) or getattr(args, "auto_zip", False):
+            if getattr(args, "run_root", None) and args.shard_index is not None and args.shard_count:
+                expected = [os.path.join(_parent_dir, f"{args.run_root}_s{i}") for i in range(int(args.shard_count))]
+                if all(os.path.isdir(d) for d in expected):
+                    lock_path = os.path.join(_parent_dir, ".zip.lock")
+                    try:
+                        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                        os.close(fd)
+                        zip_path = os.path.join(REPORTS_DIR, f"{args.run_root}.zip")
+                        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                            for root, _, files in os.walk(_parent_dir):
+                                for fn in files:
+                                    # skip lock file and nested zips if any
+                                    if fn.endswith(".lock") or (fn.endswith(".zip") and root == REPORTS_DIR):
+                                        continue
+                                    fp = os.path.join(root, fn)
+                                    arc = os.path.relpath(fp, REPORTS_DIR)
+                                    zf.write(fp, arcname=arc)
+                        print(f"[bundle] Created parent zip: {zip_path}")
+                    finally:
+                        try: os.unlink(lock_path)
+                        except: pass
+    except Exception as _zip_e:
+        print(f"[WARN] auto-zip failed: {_zip_e}")
+    # --- /auto-zip ---
+
 
 
 if __name__ == "__main__":

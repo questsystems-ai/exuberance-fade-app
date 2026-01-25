@@ -49,7 +49,7 @@ def generate_quick_report(run_dir: str) -> dict:
             json.dump({"run_id": rd.name, "n_trades": 0}, f, indent=2)
         return {"bot_summary": str(bot_json)}
 
-    trades = pd.read_csv(trades_fp, parse_dates=["entry_ts", "exit_ts"], infer_datetime_format=True)
+    trades = pd.read_csv(trades_fp, parse_dates=["entry_ts", "exit_ts"])
     meta = {}
     if run_meta_fp.exists():
         with open(run_meta_fp, "r") as f:

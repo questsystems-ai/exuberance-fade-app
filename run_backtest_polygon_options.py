@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+import argparse, os, json, math, csv
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import pytz
+from tqdm import tqdm
+
+from config import DATA_DIR, REPORTS_DIR, DEFAULT_SYMBOLS
+from data_ingest import load_local_parquet, load_alpaca_minutes, load_polygon_minutes as load_polygon_minutes_single
+from monitoring import AlertManager, RateLimitGuard
+
+@dataclass
+class OptParams:
+    use_covered_calls: bool = True
+    # selection / liquidity
+    min_price: float = 5.0
+    dollar_vol_min: float = 1_000_000.0
+    # IV gating
+    iv_rank_min: float = 0.60
+    iv_lookback_days: int = 252
+    # cadence / strike logic
+    dte_target: int = 5
+    rebalance_day: str = "Mon"
+    strike_otm_pct: float = 0.05
+    delta_target: Optional[float] = None
+    min_premium_yield: float = 0.01
+    prefer_assignment: bool = True
+    # sizing
+    allocation_pct: float = 0.50
+    max_positions: int = 5
+    # risk/rules
+    earnings_avoid: bool = True
+    earnings_buffer_days: int = 2
+    roll_down_pct: float = 0.10
+    take_profit_prem_decay: float = 0.80
+    txn_cost_per_contract: float = 0.65
+    # simulation
+    initial_equity: float = 100_000.0
+    seed: int = 1337
+
+ET = pytz.timezone("America/New_York")
+
+def _to_utc_ts(x: pd.Timestamp) -> pd.Timestamp:
+    if isinstance(x, pd.Timestamp):
+        return x if x.tzinfo else x.tz_localize('UTC')
+    return pd.Timestamp(x, tz='UTC')
+
+def _series_to_et_norm(s: pd.Series) -> pd.Series:
+    if s.dt.tz is None:
+        s = s.dt.tz_localize('UTC')
+    return s.dt.tz_convert(ET).dt.normalize()
+
+def _is_rebalance_day(ts: pd.Timestamp, want: str) -> bool:
+    ts = _to_utc_ts(ts).tz_convert(ET)
+    return ts.day_name()[:3].lower() == want[:3].lower()
+
+def _end_of_week(ts: pd.Timestamp) -> pd.Timestamp:
+    d = _to_utc_ts(ts).tz_convert(ET)
+    days_ahead = (4 - d.dayofweek) % 7  # Friday=4
+    fri = (d + pd.Timedelta(days=days_ahead)).normalize() + pd.Timedelta(hours=16)
+    return fri.tz_convert("UTC")
+
+def realized_sigma_series(daily_close: pd.Series, lookback: int = 21) -> pd.Series:
+    rets = np.log(daily_close).diff()
+    return rets.rolling(lookback).std() * np.sqrt(252.0)
+
+def realized_sigma(daily_close: pd.Series, lookback: int = 21) -> float:
+    s = realized_sigma_series(daily_close, lookback=lookback)
+    v = float(s.dropna().iloc[-1]) if len(s.dropna()) else 0.2
+    return v if np.isfinite(v) and v > 0 else 0.2
+
+def black_scholes_call_price(S, K, T, r, sigma):
+    if T <= 0 or sigma <= 0:
+        return max(0.0, S - K)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    from math import erf, sqrt
+    N = lambda x: 0.5 * (1 + erf(x / sqrt(2)))
+    return S * N(d1) - K * math.exp(-r*T) * N(d2)
+
+def approximate_call_premium(spot, strike, dte_days, sigma_annual, r=0.01):
+    T = max(1e-6, dte_days / 365.0)
+    return black_scholes_call_price(spot, strike, T, r, sigma_annual)
+
+def nearest_otm_strike(spot: float, pct: float) -> float:
+    return round(spot * (1.0 + pct), 2)
+
+def _daily_frame(df_min: pd.DataFrame) -> pd.DataFrame:
+    d = df_min.copy()
+    if d["timestamp"].dt.tz is None:
+        d["timestamp"] = d["timestamp"].dt.tz_localize('UTC')
+    d["date"] = d["timestamp"].dt.tz_convert(ET).dt.normalize()
+    g = d.groupby("date")
+    return pd.DataFrame({
+        "close": g["close"].last(),
+        "dollar_vol": (g["close"].last() * g["volume"].sum()).astype(float)
+    })
+
+def _load_earnings_calendar(path: Optional[str]) -> Dict[str, List[pd.Timestamp]]:
+    if not path or not os.path.exists(path):
+        return {}
+    out: Dict[str, List[pd.Timestamp]] = {}
+    import csv as _csv
+    with open(path, "r", newline="") as f:
+        r = _csv.DictReader(f)
+        for row in r:
+            sym = row.get("symbol","").strip().upper()
+            ds = row.get("date","").strip()
+            if not sym or not ds: continue
+            try:
+                t = pd.Timestamp(ds)
+                t = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+            except Exception:
+                continue
+            out.setdefault(sym, []).append(t)
+    for k in out: out[k].sort()
+    return out
+
+def _within_earnings_buffer(earnings, symbol: str, expiry_utc: pd.Timestamp, buffer_days: int) -> bool:
+    if symbol not in earnings: return False
+    buf = pd.Timedelta(days=buffer_days)
+    return any(abs(expiry_utc - d) <= buf for d in earnings[symbol])
+
+def compute_iv_rank_today(daily: pd.DataFrame, iv_lookback_days: int) -> float:
+    if "iv" in daily.columns:
+        s = daily["iv"].dropna().tail(iv_lookback_days)
+    else:
+        s = realized_sigma_series(daily["close"]).dropna().tail(iv_lookback_days)
+    if s.empty: return 0.0
+    cur, lo, hi = float(s.iloc[-1]), float(s.min()), float(s.max())
+    return 0.0 if hi <= lo else float((cur - lo) / (hi - lo))
+
+def _compute_metrics_from_equity(ec: pd.DataFrame, initial_equity: float):
+    """
+    Compute investor-friendly metrics from minute-level equity curve.
+    Returns dict with cumulative_return, cagr, ann_vol, sharpe, max_dd, calmar, profit_factor,
+    daily_win_rate, weekly_win_rate.
+    """
+    if ec is None or ec.empty:
+        return {}
+    df = ec.copy()
+    if df["timestamp"].dt.tz is None:
+        df["timestamp"] = df["timestamp"].dt.tz_localize("UTC")
+    eq = df.copy()
+    eq["date_et"] = eq["timestamp"].dt.tz_convert(ET).dt.normalize()
+    daily = eq.groupby("date_et")["equity"].last().dropna()
+    if len(daily) < 2:
+        return {}
+    ret = daily.pct_change().dropna()
+
+    cumulative_return = float(daily.iloc[-1] / float(initial_equity) - 1.0)
+    days = (daily.index[-1] - daily.index[0]).days or 1
+    years = days / 365.25
+    cagr = float((daily.iloc[-1] / float(initial_equity)) ** (1/years) - 1.0) if years > 0 else float("nan")
+    ann_vol = float(ret.std(ddof=1) * (252 ** 0.5)) if len(ret) > 1 else float("nan")
+    sharpe = float(cagr / ann_vol) if ann_vol and ann_vol > 0 else float("nan")
+
+    roll_max = daily.cummax()
+    dd_series = daily / roll_max - 1.0
+    max_dd = float(dd_series.min() if len(dd_series) else 0.0)
+    calmar = float(cagr / abs(max_dd)) if max_dd < 0 else float("inf")
+
+    pos = ret[ret > 0].sum()
+    neg = ret[ret < 0].sum()
+    profit_factor = float(pos / abs(neg)) if neg < 0 else float("inf")
+
+    daily_win_rate = float((ret > 0).mean())
+
+    eq["week_et"] = eq["timestamp"].dt.tz_convert(ET).dt.to_period("W").apply(lambda p: p.start_time)
+    wk = eq.groupby("week_et")["equity"].agg(["first","last"]).dropna()
+    wk_ret = (wk["last"] / wk["first"] - 1.0).dropna()
+    weekly_win_rate = float((wk_ret > 0).mean()) if len(wk_ret) else float("nan")
+
+    return {
+        "cumulative_return": cumulative_return,
+        "cagr": cagr,
+        "ann_vol": ann_vol,
+        "sharpe": sharpe,
+        "max_dd": max_dd,
+        "calmar": calmar,
+        "profit_factor": profit_factor,
+        "daily_win_rate": daily_win_rate,
+        "weekly_win_rate": weekly_win_rate
+    }
+
+def simulate_covered_calls(df_min: pd.DataFrame, p: OptParams, rng: np.random.Generator,
+                           symbol: str,
+                           earnings_map: Optional[Dict[str, List[pd.Timestamp]]] = None,
+                           weekly_states_writer: Optional[csv.DictWriter] = None):
+    if df_min is None or df_min.empty:
+        return {"equity_curve": pd.DataFrame(), "trades": pd.DataFrame(), "metrics": {}}
+    df = df_min.sort_values("timestamp").copy()
+    if df["timestamp"].dt.tz is None:
+        df["timestamp"] = df["timestamp"].dt.tz_localize('UTC')
+
+    daily = _daily_frame(df).dropna()
+    if daily.empty:
+        return {"equity_curve": pd.DataFrame(), "trades": pd.DataFrame(), "metrics": {}}
+
+    ok_days = daily["dollar_vol"] >= p.dollar_vol_min
+    allowed_dates = set(daily.index[ok_days])
+    df = df[_series_to_et_norm(df["timestamp"]).isin(allowed_dates)]
+    if df.empty:
+        return {"equity_curve": pd.DataFrame(), "trades": pd.DataFrame(), "metrics": {}}
+
+    sig = realized_sigma(daily["close"], lookback=21)
+
+    equity = p.initial_equity
+    shares = 0
+    avg_cost = 0.0
+    open_call = None
+    logs = []
+    weekly_rows = []
+
+    def target_blocks(spot):
+        cap = equity * p.allocation_pct
+        return max(0, int(cap // (spot * 100)))
+
+    for day, chunk in df.groupby(_series_to_et_norm(df["timestamp"])):
+        if chunk.empty: continue
+        spot_open = float(chunk.iloc[0]["close"])
+        spot_last = float(chunk.iloc[-1]["close"])
+
+        iv_rank_today = compute_iv_rank_today(daily.loc[:day], p.iv_lookback_days)
+
+        wrote_this_week = False
+        skipped_reason = None
+        if _is_rebalance_day(pd.Timestamp(day), p.rebalance_day):
+            blocks = target_blocks(spot_open)
+            want_shares = blocks * 100
+            if want_shares > shares:
+                add = want_shares - shares
+                cost = add * spot_open
+                if cost <= equity:
+                    equity -= cost
+                    avg_cost = (avg_cost * shares + cost) / (shares + add) if shares + add > 0 else 0.0
+                    shares += add
+
+            if open_call is None and shares >= 100 and p.use_covered_calls:
+                expiry = _end_of_week(chunk.iloc[0]["timestamp"])
+                if p.earnings_avoid and _within_earnings_buffer(earnings_map or {}, symbol, expiry, p.earnings_buffer_days):
+                    skipped_reason = "earnings_gate"
+                elif iv_rank_today < p.iv_rank_min:
+                    skipped_reason = "iv_rank_gate"
+                else:
+                    if p.delta_target is not None:
+                        strike = nearest_otm_strike(spot_open, max(0.01, p.strike_otm_pct))
+                    else:
+                        strike = nearest_otm_strike(spot_open, p.strike_otm_pct)
+                    if p.prefer_assignment:
+                        strike = nearest_otm_strike(spot_open, max(0.0, p.strike_otm_pct - 0.01))
+
+                    prem = approximate_call_premium(spot_open, strike, p.dte_target, sig)
+                    if prem / max(1e-6, spot_open) >= p.min_premium_yield:
+                        contracts = shares // 100
+                        open_call = {"strike": strike, "premium": prem, "contracts": contracts, "expiry": expiry}
+                        equity += prem * contracts * 100
+                        wrote_this_week = True
+                        logs.append({"ts": chunk.iloc[0]["timestamp"], "action": "sell_call", "strike": strike,
+                                     "premium": prem, "contracts": contracts, "iv_rank": iv_rank_today})
+                    else:
+                        skipped_reason = "min_premium_gate"
+
+        if open_call is not None:
+            days_left = max(1e-6, (open_call["expiry"] - chunk.iloc[-1]["timestamp"]).total_seconds() / 86400.0)
+            initial_prem = open_call["premium"]
+            mark = initial_prem * min(1.0, days_left / p.dte_target)
+            if mark <= (1.0 - p.take_profit_prem_decay) * initial_prem:
+                equity -= mark * open_call["contracts"] * 100 + p.txn_cost_per_contract * open_call["contracts"]
+                logs.append({"ts": chunk.iloc[-1]["timestamp"], "action": "buyback_call", "mark": mark,
+                             "contracts": open_call["contracts"]})
+                open_call = None
+
+        if open_call is not None and chunk.iloc[-1]["timestamp"] >= open_call["expiry"]:
+            K = open_call["strike"]; contracts = open_call["contracts"]
+            if spot_last >= K:
+                shares_sold = contracts * 100
+                shares = max(0, shares - shares_sold)
+                equity += K * shares_sold - p.txn_cost_per_contract * contracts
+                logs.append({"ts": open_call["expiry"], "action": "assignment", "strike": K, "contracts": contracts})
+                avg_cost = 0.0 if shares == 0 else avg_cost
+            open_call = None
+
+        if shares > 0 and p.roll_down_pct > 0 and avg_cost > 0:
+            if spot_last <= avg_cost * (1.0 - p.roll_down_pct):
+                avg_cost = spot_last
+
+        weekly_rows.append({
+            "date": pd.Timestamp(day).strftime("%Y-%m-%d"),
+            "symbol": symbol, "equity": equity, "shares": shares, "avg_cost": avg_cost,
+            "open_call_strike": open_call["strike"] if open_call else None,
+            "open_call_expiry": open_call["expiry"].strftime("%Y-%m-%d %H:%M:%S%z") if open_call else None,
+            "iv_rank": iv_rank_today,
+            "rebalance_day": _is_rebalance_day(pd.Timestamp(day), p.rebalance_day),
+            "wrote_call": wrote_this_week, "skip_reason": skipped_reason
+        })
+
+        nav = equity + shares * spot_last
+        if open_call is not None:
+            days_left = max(1e-6, (open_call["expiry"] - chunk.iloc[-1]["timestamp"]).total_seconds() / 86400.0)
+            mark = approximate_call_premium(spot_last, open_call["strike"], days_left, realized_sigma(daily["close"]))
+            nav -= mark * open_call["contracts"] * 100
+        df.loc[chunk.index, "nav"] = nav
+
+    ec = df[["timestamp"]].copy()
+    ec["equity"] = df["nav"]
+    trades = pd.DataFrame(logs)
+    total_pnl = float(ec["equity"].iloc[-1] - p.initial_equity) if len(ec) else 0.0
+    dd = (ec["equity"] / ec["equity"].cummax() - 1.0).min() if len(ec) else 0.0
+    metrics = {"total_pnl": total_pnl, "max_dd": float(dd or 0.0)}
+    more = _compute_metrics_from_equity(ec, p.initial_equity)
+    if more: metrics.update(more)
+
+    # --- FIX: actually emit weekly rows to weekly_states.csv ---
+    if weekly_states_writer is not None and weekly_rows:
+        try:
+            weekly_states_writer.writerows(weekly_rows)
+        except Exception:
+            pass
+    return {"equity_curve": ec, "trades": trades, "metrics": metrics}
+
+def _load_underlying(symbol: str, start: str, end: str, source: str, alp_guard, pol_guard, alert) -> pd.DataFrame:
+    if source == "local":
+        return load_local_parquet(symbol, start, end, data_dir=DATA_DIR)
+    elif source == "alpaca":
+        df = load_alpaca_minutes(symbol, start, end, rth_only=True); alp_guard.record(1); return df
+    elif source == "polygon":
+        df = load_polygon_minutes_single(symbol, start, end, rth_only=True); pol_guard.record(1); return df
+    else:
+        raise ValueError(f"Unknown source: {source}")
+
+def main():
+    ap = argparse.ArgumentParser(description="Options Backtester — Covered Calls (earnings + IV-rank + weekly states + metrics)")
+    ap.add_argument("--symbols", nargs="*", default=DEFAULT_SYMBOLS)
+    ap.add_argument("--basket", type=str, default=None)
+    ap.add_argument("--baskets_json", type=str, default="baskets.json")
+    ap.add_argument("--source", default="polygon", choices=["local","alpaca","polygon"])
+    ap.add_argument("--start", default="2024-01-01")
+    ap.add_argument("--end",   default="2025-08-31")
+    ap.add_argument("--run-tag", type=str, default=None)
+
+    ap.add_argument("--initial_equity", type=float, default=100_000.0)
+    ap.add_argument("--allocation_pct", type=float, default=None)
+    ap.add_argument("--strike_otm_pct", type=float, default=None)
+    ap.add_argument("--min_premium_yield", type=float, default=None)
+    ap.add_argument("--delta_target", type=float, default=None)
+    ap.add_argument("--dte_target", type=int, default=None)
+    ap.add_argument("--iv_rank_min", type=float, default=None)
+
+    ap.add_argument("--earnings_csv", type=str, default=None)
+    ap.add_argument("--earnings_buffer_days", type=int, default=None)
+
+    args = ap.parse_args()
+    p = OptParams(initial_equity=args.initial_equity)
+    for name in ["allocation_pct","strike_otm_pct","min_premium_yield","delta_target","dte_target","iv_rank_min","earnings_buffer_days"]:
+        v = getattr(args, name, None)
+        if v is not None: setattr(p, name, v)
+
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    now_utc = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SZ")
+    run_dir = os.path.join(REPORTS_DIR, f"{now_utc}_options_{args.run_tag or 'run'}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    alert = AlertManager(run_dir)
+    alp_guard = RateLimitGuard("Alpaca", 200, alert)
+    pol_guard = RateLimitGuard("Polygon", 60, alert)
+
+    rng = np.random.default_rng(p.seed)
+
+    # Basket resolution
+    if args.basket:
+        bpath = args.baskets_json or "baskets.json"
+        if not os.path.exists(bpath):
+            here = os.path.dirname(__file__)
+            b2 = os.path.join(here, os.path.basename(bpath))
+            bpath = b2 if os.path.exists(b2) else bpath
+        with open(bpath, "r") as f:
+            baskets = json.load(f)
+        if args.basket not in baskets:
+            raise KeyError(f"Basket '{args.basket}' not found in {bpath}")
+        args.symbols = baskets[args.basket]
+        print(f"Using basket '{args.basket}':", " ".join(args.symbols))
+
+    earnings_map = _load_earnings_calendar(args.earnings_csv)
+
+    weekly_path = os.path.join(run_dir, "weekly_states.csv")
+    ws_file = open(weekly_path, "w", newline="")
+    ws_fields = ["date","symbol","equity","shares","avg_cost","open_call_strike","open_call_expiry","iv_rank","rebalance_day","wrote_call","skip_reason"]
+    weekly_writer = csv.DictWriter(ws_file, fieldnames=ws_fields)
+    weekly_writer.writeheader()
+
+    results = []
+    all_trades = []
+    try:
+        for sym in tqdm(args.symbols, desc="Simulating options"):
+            try:
+                df = _load_underlying(sym, args.start, args.end, args.source, alp_guard, pol_guard, alert)
+                if df is None or df.empty: continue
+                out = simulate_covered_calls(df, p, rng, symbol=sym, earnings_map=earnings_map, weekly_states_writer=weekly_writer)
+                m = out["metrics"]; results.append({"symbol": sym, **m})
+                t = out["trades"].copy()
+                if not t.empty:
+                    t["symbol"] = sym; all_trades.append(t)
+            except Exception as e:
+                alert.error(f"{sym}: {e}")
+                continue
+    finally:
+        ws_file.close()
+
+    res = pd.DataFrame(results)
+    res.to_csv(os.path.join(run_dir, "summary.csv"), index=False)
+    if all_trades:
+        pd.concat(all_trades, ignore_index=True).to_csv(os.path.join(run_dir, "trades.csv"), index=False)
+
+    meta = {"args": vars(args), "params": asdict(p), "symbols": args.symbols, "start": args.start, "end": args.end, "run_dir": run_dir, "weekly_states": weekly_path}
+    with open(os.path.join(run_dir, "run_meta.json"), "w") as f: json.dump(meta, f, indent=2)
+
+    print("Done. Run folder:", run_dir)
+    print("  - summary.csv, trades.csv, weekly_states.csv, run_meta.json")
+
+if __name__ == "__main__":
+    main()

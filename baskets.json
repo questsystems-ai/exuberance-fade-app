@@ -1,0 +1,171 @@
+{
+  "nvda_adjacent": [
+    "NVDA",
+    "AMD",
+    "AVGO",
+    "MRVL",
+    "ARM",
+    "TSM",
+    "MSFT",
+    "AMZN",
+    "GOOGL"
+  ],
+  "high_vol": [
+    "TSLA",
+    "COIN",
+    "RIVN",
+    "HOOD",
+    "PLTR",
+    "MSTR",
+    "AFRM",
+    "LCID"
+  ],
+  "ev_adjacent": [
+    "TSLA",
+    "RIVN",
+    "LCID",
+    "NIO",
+    "CHPT",
+    "BLNK"
+  ],
+  "crypto_adjacent": [
+    "COIN",
+    "MSTR",
+    "RIOT",
+    "MARA",
+    "HOOD"
+  ],
+  "bio_adjacent": [
+    "MRNA",
+    "BNTX",
+    "NVAX",
+    "VIR",
+    "PFE"
+  ],
+  "meme_adjacent_hist": [
+    "GME",
+    "AMC",
+    "BB",
+    "KOSS"
+  ],
+  "arm_adjacent": [
+    "ARM",
+    "QCOM",
+    "SIMO",
+    "CEVA",
+    "ALGM",
+    "INTC"
+  ],
+  "travel_adjacent": [
+    "UAL",
+    "DAL",
+    "AAL",
+    "CCL",
+    "RCL",
+    "BKNG"
+  ],
+  "recent_ipos": [
+    "ARM",
+    "CART",
+    "KVYO",
+    "BIRK"
+  ],
+  "ai_infra": [
+    "ANET",
+    "SMCI",
+    "EQIX",
+    "DLR",
+    "CSCO",
+    "AMZN",
+    "MSFT",
+    "GOOGL",
+    "META"
+  ],
+  "ai_energy": [
+    "NEE",
+    "SO",
+    "DUK",
+    "SMR",
+    "BWXT",
+    "FSLR",
+    "TSLA"
+  ],
+  "ai_supply_chain": [
+    "ASML",
+    "AMAT",
+    "LRCX",
+    "ACLS",
+    "GLW",
+    "AVGO",
+    "MRVL",
+    "AMD",
+    "TSM"
+  ],
+  "fusion_spec": [
+    "SMR",
+    "BWXT",
+    "LMT",
+    "BA",
+    "GE"
+  ],
+  "ai_water_cooling": [
+    "VRT",
+    "ETN",
+    "JCI",
+    "CARR",
+    "TT",
+    "SCHNYY",
+    "ABB"
+  ],
+  "ai_optical_interconnects": [
+    "FN",
+    "CIEN",
+    "INFN",
+    "LITE",
+    "AAOI",
+    "COHR",
+    "MTSI",
+    "GLW"
+  ],
+  "ai_grid_storage": [
+    "FLNC",
+    "STEM",
+    "TSLA",
+    "GNRC",
+    "ENPH",
+    "RUN",
+    "AES",
+    "NEE",
+    "GWH",
+    "PLUG",
+    "BE"
+  ],
+  "ai_power_infra": [
+    "ETN",
+    "PWR",
+    "EMR",
+    "ABB",
+    "VRT",
+    "GE",
+    "AMPS"
+  ],
+  "ai_memory_hbm": [
+    "MU",
+    "WDC",
+    "AMAT",
+    "LRCX",
+    "ASML",
+    "ACLS",
+    "KLIC"
+  ],
+  "ai_datacenter_reits": [
+    "EQIX",
+    "DLR",
+    "IRM"
+  ],
+  "ai_water_utilities": [
+    "AWK",
+    "CWT",
+    "WTRG"
+  ]
+}

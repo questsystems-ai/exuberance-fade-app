@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # Exuberance Fade Backtester — cleaned & guarded
 # Implements RTH helper + shard slicing guard + window QC logging.
+# This version adds Polygon parallel prefetch + CLI flags and a resilient monkeypatch
+# that accepts arbitrary kwargs to avoid signature mismatches.
 
 import argparse, os, json, warnings, time
 from dataclasses import asdict
@@ -18,8 +20,16 @@ from data_ingest import (
     load_local_parquet,
     generate_synthetic_minutes,
     load_alpaca_minutes,
-    load_polygon_minutes,
 )
+# Polygon parallel + original single-symbol loader
+from data_ingest import load_polygon_minutes_multi
+from data_ingest import load_polygon_minutes as _orig_load_polygon_minutes
+
+# Provide a GLOBAL default name that other helpers can call.
+# We will overwrite this symbol later (monkeypatch) after args are parsed.
+def load_polygon_minutes(symbol, *args, **kwargs):
+    return _orig_load_polygon_minutes(symbol, *args, **kwargs)
+
 from signals import (
     add_intraday_features,
     signal_gap_fade,
@@ -110,6 +120,7 @@ def _load_symbol_data(symbol: str, start: str, end: str, source: str,
             alp_guard.record(1)
             return df
         elif source == "polygon":
+            # This call resolves to the GLOBAL name we set above; monkeypatched later.
             df = load_polygon_minutes(symbol, start, end, rth_only=False)
             pol_guard.record(1)
             return df
@@ -273,12 +284,12 @@ def main():
     ap.add_argument("--fast", action="store_true")
     ap.add_argument("--max-combos", type=int, default=None)
     ap.add_argument("--train-months", type=int, default=None)
-    ap.add_argument("--test-months",  type=int, default=None)  # type: ignore[assignment]
+    ap.add_argument("--test-months",  type=int, default=None)
 
     ap.add_argument("--write-cache", action="store_true")
     ap.add_argument("--run-tag", type=str, default=None)
 
-    # rate-limit knobs
+    # rate-limit knobs (legacy; still used for logging)
     ap.add_argument("--alpaca-limit", type=int, default=200)
     ap.add_argument("--polygon-limit", type=int, default=60)
 
@@ -287,7 +298,87 @@ def main():
 
     ap.add_argument("--use-optimized", action="store_true", default=False,                    help="Re-sim with best params from summary.csv before writing report")
     ap.add_argument("--min-rth-bars-per-day", type=int, default=0,                    help="Drop US/Eastern days with fewer than N RTH minute bars (0=off)")
+    # NEW: Polygon parallel knobs
+    ap.add_argument("--polygon-max-concurrency", type=int, default=6,
+                    help="Max concurrent Polygon requests (default 6)")
+    ap.add_argument("--polygon-reqs-per-min", type=int, default=100,
+                    help="Soft RPM clamp for Polygon (default 100)")
+
     args = ap.parse_args()
+
+    
+# --- polygon: global prefetch + monkeypatch ---
+try:
+    _polygon_frames = None
+    if getattr(args, "source", "local") == "polygon":
+        # normalize symbols (support commas and whitespace)
+        _symbols_list = []
+        _syms = getattr(args, "symbols", [])
+        if isinstance(_syms, (list, tuple)):
+            for x in _syms:
+                for tok in str(x).replace(",", " ").split():
+                    if tok.strip():
+                        _symbols_list.append(tok.strip().upper())
+        elif isinstance(_syms, str):
+            _symbols_list = [t.strip().upper() for t in _syms.replace(",", " ").split() if t.strip()]
+        if not _symbols_list:
+            raise RuntimeError("No symbols parsed for Polygon prefetch")
+
+        from pandas.tseries.offsets import MonthEnd
+        import pandas as _pd
+        start_ts = _pd.Timestamp(args.start, tz="UTC").normalize()
+        end_ts   = _pd.Timestamp(args.end,   tz="UTC").normalize()
+        months = list(_pd.period_range(start_ts.to_period("M"), end_ts.to_period("M"), freq="M"))
+
+        # chunk by month to avoid long pagination chains
+        _acc = {s: [] for s in _symbols_list}
+        for per in months:
+            m_start = _pd.Timestamp(f"{per.year}-{per.month:02d}-01", tz="UTC")
+            m_end   = (m_start + MonthEnd(1)).normalize() + _pd.Timedelta(hours=23, minutes=59, seconds=59)
+            _part = load_polygon_minutes_multi(
+                _symbols_list,
+                m_start.isoformat(),
+                m_end.isoformat(),
+                rth_only=getattr(args, "rth_only", True),
+                adjusted=False,  # raw to match Alpaca
+                max_concurrency=int(getattr(args, "polygon_max_concurrency", 6)),
+                reqs_per_min=int(getattr(args, "polygon_reqs_per_min", 100)),
+            )
+            # accumulate
+            for sym, df in _part.items():
+                if df is not None and not df.empty:
+                    _acc[sym].append(df)
+            print(f"[polygon] month {per} fetched; symbols with rows:",
+                  {k: sum(len(x) for x in v) for k,v in _acc.items()})
+
+        # combine per symbol
+        _polygon_frames = {}
+        for sym, parts in _acc.items():
+            if parts:
+                import pandas as _pd
+                df = _pd.concat(parts, ignore_index=True).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+                _polygon_frames[sym] = df.reset_index(drop=True)
+            else:
+                _polygon_frames[sym] = None
+
+        ok = sum(1 for v in _polygon_frames.values() if v is not None and not v.empty)
+        print(f"[polygon] prefetched {ok}/{len(_symbols_list)} symbols across {len(months)} months (chunked)")
+    else:
+        _polygon_frames = None
+
+    # Monkeypatch stays the same
+    def load_polygon_minutes(symbol, *args2, **kwargs2):
+        if _polygon_frames is not None and isinstance(symbol, str):
+            _sym = symbol.strip().upper()
+            _df = _polygon_frames.get(_sym)
+            if _df is not None:
+                return _df
+        return _orig_load_polygon_minutes(symbol, *args2, **kwargs2)
+
+except Exception as _e:
+    print(f"[WARN] polygon prefetch/monkeypatch failed: {_e} (falling back to per-call loader)")
+# --- /polygon: global prefetch + monkeypatch ---
+---------------------------
 
     # Make run folder & alert channel
     os.makedirs(REPORTS_DIR, exist_ok=True)
@@ -431,77 +522,6 @@ def main():
             seed=args.seed,
         )
         save_results(wf, os.path.join(run_dir, "summary.csv"))
-
-        # --- use-optimized(best_params) ---
-        if getattr(args, "use_optimized", False):
-            try:
-                import os, json, ast
-                import pandas as _pd
-                from dataclasses import fields as _fields
-                _summ = _pd.read_csv(os.path.join(run_dir, "summary.csv"))
-                # choose "best" row
-                _keys = ["test_total_pnl","test_pnl","objective","score","val_score","val_pnl","mean_test_pnl"]
-                for _k in _keys:
-                    if _k in _summ.columns:
-                        _row = _summ.sort_values(_k, ascending=False).iloc[0]
-                        break
-                else:
-                    _row = _summ.iloc[0]
-
-                # parse best_params column if present
-                _bp_raw = _row.get("best_params", None)
-                _bp_dict = {}
-                if isinstance(_bp_raw, dict):
-                    _bp_dict = _bp_raw
-                elif isinstance(_bp_raw, str) and _bp_raw.strip():
-                    try:
-                        _bp_dict = json.loads(_bp_raw)
-                    except Exception:
-                        try:
-                            _bp_dict = ast.literal_eval(_bp_raw)
-                        except Exception:
-                            _bp_dict = {}
-                # snapshot raw best_params
-                try:
-                    with open(os.path.join(run_dir, "best_params.json"), "w") as _f:
-                        json.dump(_bp_dict, _f, indent=2)
-                except Exception:
-                    pass
-
-                # synonyms & casting to Params types
-                from dataclasses import asdict
-                _syn = {"z_th":"vwap_z","hold":"hold_minutes","hold_mins":"hold_minutes","timeout":"hold_minutes"}
-                _field_types = {f.name: f.type for f in _fields(Params)}
-                _kw = {}
-                for k,v in list(_bp_dict.items()):
-                    name = _syn.get(k, k)
-                    if name in _field_types:
-                        t = _field_types[name]
-                        try:
-                            if t is bool:
-                                v = bool(int(v)) if isinstance(v, str) else bool(v)
-                            elif t in (int, float):
-                                v = t(v)
-                        except Exception:
-                            pass
-                        _kw[name] = v
-
-                _before = asdict(base)
-                if _kw:
-                    base = Params(**{**_before, **_kw})
-                    _changed = {k: (_before.get(k), _kw[k]) for k in _kw if _before.get(k) != _kw[k]}
-                    print("[use-optimized] Applied best_params:", _changed if _changed else "(no material deltas)")
-                    # write applied params snapshot
-                    try:
-                        with open(os.path.join(run_dir, "best_params_applied.json"), "w") as _f:
-                            json.dump(_kw, _f, indent=2)
-                    except Exception:
-                        pass
-                else:
-                    print("[use-optimized] best_params present but no fields matched Params; using base.")
-            except Exception as _e:
-                print(f"[WARN] use-optimized(best_params) failed: {_e}; continuing with base.")
-        # --- /use-optimized(best_params) ---
 
     # 5) Baseline cross-sectional sim -----------------------------------------
     dfs_selected = annotate_candidates(dfs, base, top_k_per_min=getattr(base, "top_k_per_min", 5))

@@ -1,12 +1,16 @@
+# env / build
 .venv/
+env/
 __pycache__/
-*.nbi
-*.nbc
+.ipynb_checkpoints/
+*.pyc
 
-# local data cache
-data/minute_bars/
-data/**/*.parquet
+# local secrets
+.env
 
-# log/noise
+# big artifacts (keep out of git)
+reports/
+*.zip
+*.tgz
+*.tar.gz
 *.log
-jupyter.log
